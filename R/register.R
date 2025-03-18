@@ -1,31 +1,143 @@
-# register ---------------------------------------------------------------------
-stoppers <- rlang::new_environment()
+# todos ------------------------------------------------------------------------
 
-register_stopper <- function(fun, message) {
+# TODO: BEFORE you start implementing a bunch of stuff, now that you've got the
+# bones you should CREATE A TESTING SUITE. Make a bunch of tests and supports
+# now, so you know the basics are robust BEFORE you waste time implementing a
+# billion other features.
+#
+# Most of what you need:
+# - automatic message conversion
+# - function registration
+# - `stop_if_not()`
+#
+# Is already implemented. So it's really just about adding features now. Which is
+# why you SHOULD TEST THE FRAMEWORK FIRST.
+
+# register ---------------------------------------------------------------------
+messengers <- rlang::new_environment()
+
+register_stopper <- function(
+    fun,
+    message,
+    # TODO: Think about how you want to treat these, if they're NULL maybe just
+    # set them to a default message, so that when you hit a stopper it *always*
+    # has a message to emit (i.e. if we hit a `stopper` "leaf" while generating
+    # a message, we'll always be able to emit a message..., I'm not sure though
+    # we could always dip on the stopper if it's NULL and then defer)
+    not_message = NULL,
+    any_message = NULL,
+    all_message = NULL,
+    none_message = NULL
+  ) {
+
   fun_expr <- substitute(fun)
   stopifnot(
     "`fun` must be a function." = is.function(fun),
     "`fun` must be a function provided by name." = is.symbol(fun_expr) || rlang::is_call(fun_expr, c("::", ":::"))
   )
-  stopifnot(
-    "`message` must be a function with argument `call` or a non-NA non-empty character." =
-    is.character(message) && length(message) >= 1 && !anyNA(message) ||
-    is.function(message) && setequal(rlang::fn_fmls_names(message), "call")
-  )
-  stopifnot(
-    "If `fun` is a primitive function, then `message` must be a function, not a character." =
-    !is.primitive(fun) || is.function(message)
-  )
+  # TODO: We'll need to edit this for `not_`, `any_`, `all_`, `none_`
+  assert_valid_message <- function(message) {
+    stopifnot(
+      "`message` must be a function with argument `call` or a non-NA non-empty character." =
+        is.character(message) && length(message) >= 1 && !anyNA(message) ||
+        is.function(message) && setequal(rlang::fn_fmls_names(message), c("call", "env"))
+    )
+    stopifnot(
+      "If `fun` is a primitive function, then `message` must be a function, not a character." =
+        !is.primitive(fun) || is.function(message)
+    )
+  }
+  assert_valid_message(message)
+  # assert_valid_message(not_message)
+  # assert_valid_message(any_message)
+  # assert_valid_message(all_message)
+  # assert_valid_message(none_message)
 
-  key <- fun_to_key(fun, fun_expr = fun_expr)
   if (is.character(message)) {
     message <- new_message_fun(fun, message)
   }
+
+  key <- fun_to_key(fun, fun_expr = fun_expr)
+  messenger <- new_messenger(
+    message = message,
+    # TODO: We're not currently doing any checking for the `*_message` types
+    not_message = not_message,
+    any_message = any_message,
+    all_message = all_message,
+    none_message = none_message
+  )
+
   assign(
     x = key,
-    value = message,
-    envir = stoppers
+    value = messenger,
+    envir = messengers
   )
+}
+
+# TODO: Export
+is_stopper <- function(fun, fun_expr = substitute(fun)) {
+  key <- fun_to_key(fun, fun_expr)
+  rlang::env_has(messengers, key)
+}
+
+# Wrapper to store the different kinds of messages that a messenger can have.
+# This is subject to change, so interact with the `get_*()` and `has_*()`
+# functions defined below.
+new_messenger <- function(
+  message,
+  not_message,
+  any_message,
+  all_message,
+  none_message
+  ) {
+  structure(
+    .Data = list(),
+    class = "stopr_stopper_messenger",
+    message = message,
+    not_message = not_message,
+    any_message = any_message,
+    all_message = all_message,
+    none_message = none_message
+  )
+}
+
+get_messenger <- function(fun, fun_expr = substitute(fun)) {
+  key <- fun_to_key(fun, fun_expr)
+  messenger <- rlang::env_get(messengers, key, default = NULL)
+  if (is.null(messenger)) {
+    stop(paste0("`messenger` can't be found for `fun_expr = ", rlang::as_string(fun_expr), "`."))
+  }
+  return(messenger)
+}
+
+get_message_fun <- function(messenger) { attr(messenger, "message") }
+
+get_not_message_fun <- function(messenger) { attr(messenger, "not_message") }
+
+get_any_message_fun <- function(messenger) { attr(messenger, "any_message") }
+
+get_none_message_fun <- function(messenger) { attr(messenger, "none_message") }
+
+# NOTE: Should always have a `message`, this should be an invariant.
+#
+# has_message <- function(messenger) {
+#   !is.null(attr(messenger, "message"))
+# }
+
+has_not_message_fun <- function(messenger) {
+  !is.null(attr(messenger, "not_message"))
+}
+
+has_all_message_fun <- function(messenger) {
+  !is.null(attr(messenger, "all_message"))
+}
+
+has_any_message_fun <- function(messenger) {
+  !is.null(attr(messenger, "any_message"))
+}
+
+has_none_message_fun <- function(messenger) {
+  !is.null(attr(messenger, "none_message"))
 }
 
 # helpers ----------------------------------------------------------------------
@@ -38,6 +150,7 @@ register_stopper <- function(fun, message) {
 fun_to_key <- function(fun, fun_expr = substitute(fun)) {
   stopifnot(is.function(fun))
   ns <- environment(fun)
+  # TODO: Make sure `fun_expr` is a simple call!
   if (rlang::is_call(fun_expr)) fun_expr <- fun_expr[[3]]
   fun_name <- rlang::as_string(fun_expr)
 
@@ -52,10 +165,10 @@ fun_to_key <- function(fun, fun_expr = substitute(fun)) {
 new_message_fun <- function(fun, message) {
   force(fun)
   force(message)
-  function(call) {
+  function(call, env) {
     # This is the environment that `message` is evaluated in during {cli}
     # string interpolation in `cli::format_inline()`.
-    cli_env <- rlang::env_clone(rlang::current_env())
+    cli_env <- rlang::env_clone(env)
 
     # `args` are the unevaluated arguments to `call` (i.e. expressions) and
     # `args_eval` are the evaluated arguments to `call`.
@@ -109,26 +222,14 @@ new_message_fun <- function(fun, message) {
       dot = dot
     )
 
-    formatted <- map_chr(message, cli::format_inline, .envir = cli_env)
+    formatted <- cli_as_is(map_chr(message, cli::format_inline, .envir = cli_env))
     bullets <- rlang::names2(message)
     bullets[bullets == ""] <- "x"
     rlang::set_names(formatted, bullets)
   }
 }
 
-# Note, `defaults = TRUE, dots_expand = FALSE` won't do anything if the call
-# is a primitive function. When registering a primitive function, the `message`
-# argument in `register_stoppers` will need to be a manually created function.
-call_match_args <- function(call, fun) {
-  matched <- rlang::call_match(
-    call = call,
-    fn = fun,
-    defaults = TRUE,
-    dots_expand = FALSE
-  )
-  as.list(matched[-1L])
-}
-
+# Get the unevaluated and evaluated arguments of `call`, standardized using `call_match()`
 call_data <- function(call, fun, env) {
   ## Standardize the arguments of `call`
   call_args <- rlang::call_args(rlang::call_match(
